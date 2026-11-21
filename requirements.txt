@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+youtube-transcript-api>=1.0.0
+groq
+google-genai
