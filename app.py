@@ -24,6 +24,7 @@ app.add_middleware(
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+SUPADATA_KEY = os.environ.get("SUPADATA_API_KEY", "").strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 BUCKET = os.environ.get("SUPABASE_BUCKET", "vira-clips").strip()
@@ -102,7 +103,61 @@ def hms_to_sec(t: str) -> float:
     return parts[0]
 
 
+def _parse_supadata_content(content):
+    if isinstance(content, list):
+        entries = []
+        for item in content:
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+            if "offset" in item:
+                start_sec = float(item["offset"]) / 1000.0
+            else:
+                start_sec = float(item.get("start", 0))
+            entries.append({"start": start_sec, "text": text})
+        if entries:
+            return entries
+    elif isinstance(content, str) and content.strip():
+        return [{"start": 0.0, "text": content.strip()}]
+    return []
+
+
 def fetch_yt_transcript(vid: str):
+    if SUPADATA_KEY:
+        headers = {"x-api-key": SUPADATA_KEY}
+        yt_url = f"https://www.youtube.com/watch?v={vid}"
+        r = requests.get(
+            "https://api.supadata.ai/v1/youtube/transcript",
+            headers=headers,
+            params={"url": yt_url, "text": "false"},
+            timeout=45,
+        )
+        if not r.ok:
+            raise RuntimeError(f"Supadata error ({r.status_code}): {r.text[:200]}")
+
+        data = r.json()
+        if r.status_code == 202 and data.get("jobId"):
+            job_id = data["jobId"]
+            for _ in range(15):
+                time.sleep(2)
+                pr = requests.get(
+                    f"https://api.supadata.ai/v1/transcript/{job_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                if pr.ok:
+                    pdata = pr.json()
+                    if pdata.get("status") == "completed":
+                        data = pdata
+                        break
+                    if pdata.get("status") == "failed":
+                        raise RuntimeError(f"Supadata transcript failed: {pdata}")
+
+        entries = _parse_supadata_content(data.get("content"))
+        if entries:
+            return entries
+        raise RuntimeError("No captions available for this video via Supadata")
+
     ytt = YouTubeTranscriptApi()
     try:
         return ytt.fetch(vid, languages=["hi", "en", "en-IN", "en-US"]).to_raw_data()
@@ -141,7 +196,11 @@ Transcript:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "engine": "vira-cloud-1080p"}
+    return {
+        "status": "ok",
+        "engine": "vira-cloud-1080p",
+        "supadata": bool(SUPADATA_KEY),
+    }
 
 
 @app.post("/api/analyze-youtube")
@@ -258,3 +317,4 @@ def render_status(render_id: str):
     if not data:
         return {"render_id": render_id, "status": "queued", "message": "Preparing renderer..."}
     return data
+    
