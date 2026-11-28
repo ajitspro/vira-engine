@@ -184,7 +184,7 @@ Transcript:
 {transcript_text[:120000]}"""
 
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.0-flash",
         contents=prompt,
         config={"response_mime_type": "application/json"},
     )
