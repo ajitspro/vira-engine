@@ -168,11 +168,62 @@ def fetch_yt_transcript(vid: str):
         raise RuntimeError("No captions available for this video")
 
 
+def _clean_json_clips(raw_text: str):
+    txt = (raw_text or "").strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```(?:json)?\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt)
+    clips = json.loads(txt)
+    if isinstance(clips, dict):
+        for k in ("clips", "moments", "data", "results"):
+            if k in clips and isinstance(clips[k], list):
+                return clips[k]
+        for v in clips.values():
+            if isinstance(v, list):
+                return v
+    return clips if isinstance(clips, list) else []
+
+
+def _list_gemini_candidates(client):
+    candidates = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            low = name.lower()
+            if not low.startswith("gemini"):
+                continue
+            bad = ("embed", "imagen", "veo", "tts", "audio", "live", "aqa", "robotics", "computer-use", "image")
+            if any(b in low for b in bad):
+                continue
+            actions = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            candidates.append(name)
+    except Exception:
+        pass
+
+    def score(n: str):
+        low = n.lower()
+        is_flash = 1 if "flash" in low else 0
+        not_lite = 1 if "lite" not in low else 0
+        not_exp = 1 if ("exp" not in low and "preview" not in low) else 0
+        ver_match = re.search(r"gemini-(\d+(?:\.\d+)?)", low)
+        ver = float(ver_match.group(1)) if ver_match else 0.0
+        return (is_flash, not_lite, ver, not_exp)
+
+    candidates.sort(key=score, reverse=True)
+    for fallback in ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+    return candidates
+
+
 def pick_viral_clips(transcript_text: str, max_clips: int):
-    if not GEMINI_KEY:
-        raise HTTPException(500, "GEMINI_API_KEY missing on server")
-    client = genai.Client(api_key=GEMINI_KEY)
-    prompt = f"""You are a viral short-form video editor. Analyze this transcript and extract up to {max_clips} high-retention vertical clips (each 30 to 60 seconds long).
+    errors = []
+
+    if GEMINI_KEY:
+        client = genai.Client(api_key=GEMINI_KEY)
+        prompt = f"""You are a viral short-form video editor. Analyze this transcript and extract up to {max_clips} high-retention vertical clips (each 30 to 60 seconds long).
 Return ONLY a valid JSON array of objects with exact keys:
 - "title": catchy hook title
 - "viral_score": integer 75 to 99
@@ -183,15 +234,45 @@ Return ONLY a valid JSON array of objects with exact keys:
 Transcript:
 {transcript_text[:120000]}"""
 
-    resp = client.models.generate_content(
-        model="gemini-3.0-flash",
-        contents=prompt,
-        config={"response_mime_type": "application/json"},
-    )
-    clips = json.loads(resp.text)
-    if isinstance(clips, dict) and "clips" in clips:
-        clips = clips["clips"]
-    return clips
+        for model_name in _list_gemini_candidates(client)[:6]:
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"},
+                )
+                clips = _clean_json_clips(resp.text)
+                if clips:
+                    return clips
+            except Exception as e:
+                errors.append(f"{model_name}: {str(e)[:120]}")
+
+    if GROQ_KEY:
+        try:
+            gclient = Groq(api_key=GROQ_KEY)
+            groq_prompt = f"""You are a viral short-form video editor. Analyze this transcript and extract up to {max_clips} high-retention vertical clips (each 30 to 60 seconds long).
+Return ONLY a valid JSON object with a single key "clips" containing an array of objects with exact keys:
+- "title": catchy hook title
+- "viral_score": integer 75 to 99
+- "start": "HH:MM:SS"
+- "end": "HH:MM:SS"
+- "script": short engaging summary/hook of the moment
+
+Transcript:
+{transcript_text[:28000]}"""
+            chat = gclient.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": groq_prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.4,
+            )
+            clips = _clean_json_clips(chat.choices[0].message.content)
+            if clips:
+                return clips
+        except Exception as e:
+            errors.append(f"groq: {str(e)[:120]}")
+
+    raise HTTPException(500, f"AI analysis failed: {' | '.join(errors)[:400]}")
 
 
 @app.get("/health")
@@ -211,8 +292,8 @@ def analyze_youtube(req: YTAnalyzeReq):
     except Exception as e:
         raise HTTPException(400, f"YouTube transcript error: {e}")
 
-    s_lim = hms_to_sec(req.start_time) if req.start_time else 0
-    e_lim = hms_to_sec(req.end_time) if req.end_time else 999999
+    s_lim = hms_to_sec(req.start_time) if (req.start_time and req.start_time.strip()) else 0
+    e_lim = hms_to_sec(req.end_time) if (req.end_time and req.end_time.strip()) else 999999
     lines = [
         f"[{sec_to_hms(item['start'])}] {item['text']}"
         for item in entries
@@ -262,6 +343,10 @@ async def analyze_upload(file: UploadFile = File(...), max_clips: int = Form(10)
         job_data = {"type": "file", "url": public_src}
         supa_upload(f"jobs/{job_id}.json", json.dumps(job_data).encode(), "application/json")
         return {"job_id": job_id, "clips": clips}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Upload processing failed: {str(e)[:250]}")
     finally:
         vid_path.unlink(missing_ok=True)
         aud_path.unlink(missing_ok=True)
@@ -285,7 +370,7 @@ def start_render(req: RenderReq):
     }
     supa_upload(f"status/{render_id}.json", json.dumps(init_status).encode(), "application/json")
 
-    gh_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/render-1080p.yml/dispatches"
+    gh_url = f"[https://api.github.com/repos/](https://api.github.com/repos/){GITHUB_REPO}/actions/workflows/render-1080p.yml/dispatches"
     r = requests.post(
         gh_url,
         headers={
